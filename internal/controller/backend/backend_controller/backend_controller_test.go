@@ -148,8 +148,9 @@ var _ = Describe("Controllers/Backend/controller/backend_controller", func() {
 		It("Should handle a provider pool", func() {
 			createdBackend, err := CreateBackend(ctx, &loadBalancer.Spec.Provider, "username", "password")
 			Expect(err).ShouldNot(HaveOccurred())
-			err = createdBackend.HandlePool(ctx, pool, &monitor)
+			err, requeueAfter, _ := createdBackend.HandlePool(ctx, pool, &monitor, loadBalancer, []lbv1.DrainingMember{})
 			Expect(err).ShouldNot(HaveOccurred())
+			Expect(requeueAfter).Should(Equal(0))
 		})
 
 		It("Should handle a provider VIP", func() {

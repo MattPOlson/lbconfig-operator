@@ -343,6 +343,12 @@ func (p *F5Provider) EditPoolMember(m *lbv1.PoolMember, pool *lbv1.Pool, status 
 	return nil
 }
 
+// DisablePoolMember disables a pool member to prevent new connections while allowing existing connections to complete
+// Uses F5's PoolMemberStatus with "disable" which sets session to "user-disabled" for graceful draining
+func (p *F5Provider) DisablePoolMember(m *lbv1.PoolMember, pool *lbv1.Pool) error {
+	return p.EditPoolMember(m, pool, "disable")
+}
+
 // DeletePoolMember deletes a member in the Load Balancer
 func (p *F5Provider) DeletePoolMember(m *lbv1.PoolMember, pool *lbv1.Pool) error {
 	// First delete member from pool
