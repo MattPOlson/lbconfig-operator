@@ -197,4 +197,242 @@ var _ = Describe("Controllers/Backend/controller/backend_controller", func() {
 			Expect(output).To(BeFalse())
 		})
 	})
+
+	Context("When using drain helper functions", func() {
+		var testMember lbv1.PoolMember
+		var testDrainingMember lbv1.DrainingMember
+		var drainingList []lbv1.DrainingMember
+
+		BeforeEach(func() {
+			testMember = lbv1.PoolMember{
+				Node: lbv1.Node{
+					Name: "test-node",
+					Host: "10.0.1.100",
+				},
+				Port: 6443,
+			}
+
+			testDrainingMember = lbv1.DrainingMember{
+				PoolName:  "test-pool",
+				Node:      testMember.Node,
+				Port:      testMember.Port,
+				StartTime: metav1.Now(),
+			}
+
+			drainingList = []lbv1.DrainingMember{testDrainingMember}
+		})
+
+		Describe("IsMemberDraining", func() {
+			It("Should return nil when member is not in draining list", func() {
+				emptyList := []lbv1.DrainingMember{}
+				result := IsMemberDraining(emptyList, &testMember, "test-pool")
+				Expect(result).To(BeNil())
+			})
+
+			It("Should return nil when member host does not match", func() {
+				differentMember := testMember
+				differentMember.Node.Host = "10.0.1.200"
+				result := IsMemberDraining(drainingList, &differentMember, "test-pool")
+				Expect(result).To(BeNil())
+			})
+
+			It("Should return nil when member port does not match", func() {
+				differentMember := testMember
+				differentMember.Port = 8443
+				result := IsMemberDraining(drainingList, &differentMember, "test-pool")
+				Expect(result).To(BeNil())
+			})
+
+			It("Should return nil when pool name does not match", func() {
+				result := IsMemberDraining(drainingList, &testMember, "different-pool")
+				Expect(result).To(BeNil())
+			})
+
+			It("Should return draining member when all criteria match", func() {
+				result := IsMemberDraining(drainingList, &testMember, "test-pool")
+				Expect(result).NotTo(BeNil())
+				Expect(result.PoolName).To(Equal("test-pool"))
+				Expect(result.Node.Host).To(Equal("10.0.1.100"))
+				Expect(result.Port).To(Equal(6443))
+			})
+
+			It("Should find correct member in list with multiple draining members", func() {
+				member2 := lbv1.PoolMember{
+					Node: lbv1.Node{Name: "node2", Host: "10.0.1.101"},
+					Port: 6443,
+				}
+				draining2 := lbv1.DrainingMember{
+					PoolName:  "test-pool",
+					Node:      member2.Node,
+					Port:      member2.Port,
+					StartTime: metav1.Now(),
+				}
+				multiList := append(drainingList, draining2)
+
+				result := IsMemberDraining(multiList, &member2, "test-pool")
+				Expect(result).NotTo(BeNil())
+				Expect(result.Node.Host).To(Equal("10.0.1.101"))
+			})
+		})
+
+		Describe("RemoveDrainingMember", func() {
+			It("Should return empty list when removing only member", func() {
+				result := RemoveDrainingMember(drainingList, &testMember, "test-pool")
+				Expect(result).To(BeEmpty())
+			})
+
+			It("Should return unchanged list when member not found", func() {
+				differentMember := testMember
+				differentMember.Node.Host = "10.0.1.200"
+				result := RemoveDrainingMember(drainingList, &differentMember, "test-pool")
+				Expect(result).To(HaveLen(1))
+				Expect(result[0].Node.Host).To(Equal("10.0.1.100"))
+			})
+
+			It("Should remove only matching member from list", func() {
+				member2 := lbv1.PoolMember{
+					Node: lbv1.Node{Name: "node2", Host: "10.0.1.101"},
+					Port: 6443,
+				}
+				draining2 := lbv1.DrainingMember{
+					PoolName:  "test-pool",
+					Node:      member2.Node,
+					Port:      member2.Port,
+					StartTime: metav1.Now(),
+				}
+				multiList := append(drainingList, draining2)
+
+				result := RemoveDrainingMember(multiList, &testMember, "test-pool")
+				Expect(result).To(HaveLen(1))
+				Expect(result[0].Node.Host).To(Equal("10.0.1.101"))
+			})
+
+			It("Should preserve members from different pools", func() {
+				differentPoolMember := lbv1.DrainingMember{
+					PoolName:  "different-pool",
+					Node:      testMember.Node,
+					Port:      testMember.Port,
+					StartTime: metav1.Now(),
+				}
+				multiList := append(drainingList, differentPoolMember)
+
+				result := RemoveDrainingMember(multiList, &testMember, "test-pool")
+				Expect(result).To(HaveLen(1))
+				Expect(result[0].PoolName).To(Equal("different-pool"))
+			})
+		})
+	})
+
+	Context("When using drain orchestration in HandlePool", func() {
+		var ctx context.Context
+		var testPool *lbv1.Pool
+		var testMonitor *lbv1.Monitor
+		var lbWithDrainEnabled *lbv1.ExternalLoadBalancer
+		var lbWithDrainDisabled *lbv1.ExternalLoadBalancer
+
+		BeforeEach(func() {
+			ctx = context.TODO()
+
+			testPool = &lbv1.Pool{
+				Name: "test-pool-drain",
+				Members: []lbv1.PoolMember{{
+					Node: lbv1.Node{
+						Name: "test-node-1",
+						Host: "10.0.1.100",
+					},
+					Port: 6443,
+				}},
+			}
+
+			testMonitor = &lbv1.Monitor{
+				Path:        "/healthz",
+				Port:        6443,
+				MonitorType: "https",
+			}
+
+			lbWithDrainEnabled = &lbv1.ExternalLoadBalancer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "lb-drain-enabled",
+					Namespace: "default",
+				},
+				Spec: lbv1.ExternalLoadBalancerSpec{
+					Vip: "192.168.1.100",
+					Provider: lbv1.Provider{
+						Vendor: "Dummy",
+						Host:   "1.2.3.4",
+						Port:   443,
+						Creds:  "secretname",
+					},
+					Drain: &lbv1.DrainConfig{
+						Enabled:        true,
+						TimeoutSeconds: 30,
+					},
+				},
+			}
+
+			lbWithDrainDisabled = &lbv1.ExternalLoadBalancer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "lb-drain-disabled",
+					Namespace: "default",
+				},
+				Spec: lbv1.ExternalLoadBalancerSpec{
+					Vip: "192.168.1.101",
+					Provider: lbv1.Provider{
+						Vendor: "Dummy",
+						Host:   "1.2.3.4",
+						Port:   443,
+						Creds:  "secretname",
+					},
+					Drain: &lbv1.DrainConfig{
+						Enabled:        false,
+						TimeoutSeconds: 30,
+					},
+				},
+			}
+		})
+
+		It("Should return zero requeue time when drain is disabled", func() {
+			backend, err := CreateBackend(ctx, &lbWithDrainDisabled.Spec.Provider, "username", "password")
+			Expect(err).Should(BeNil())
+
+			err, requeueAfter, drainingMembers := backend.HandlePool(ctx, testPool, testMonitor, lbWithDrainDisabled, []lbv1.DrainingMember{})
+			Expect(err).Should(BeNil())
+			Expect(requeueAfter).Should(Equal(0))
+			Expect(drainingMembers).Should(BeEmpty())
+		})
+
+		It("Should return zero requeue time when drain config is nil", func() {
+			lbNoDrain := lbWithDrainEnabled.DeepCopy()
+			lbNoDrain.Spec.Drain = nil
+
+			backend, err := CreateBackend(ctx, &lbNoDrain.Spec.Provider, "username", "password")
+			Expect(err).Should(BeNil())
+
+			err, requeueAfter, drainingMembers := backend.HandlePool(ctx, testPool, testMonitor, lbNoDrain, []lbv1.DrainingMember{})
+			Expect(err).Should(BeNil())
+			Expect(requeueAfter).Should(Equal(0))
+			Expect(drainingMembers).Should(BeEmpty())
+		})
+
+		It("Should handle empty pool with drain enabled", func() {
+			backend, err := CreateBackend(ctx, &lbWithDrainEnabled.Spec.Provider, "username", "password")
+			Expect(err).Should(BeNil())
+
+			emptyPool := &lbv1.Pool{
+				Name:    "empty-pool",
+				Members: []lbv1.PoolMember{},
+			}
+
+			err, requeueAfter, drainingMembers := backend.HandlePool(ctx, emptyPool, testMonitor, lbWithDrainEnabled, []lbv1.DrainingMember{})
+			Expect(err).Should(BeNil())
+			Expect(requeueAfter).Should(Equal(0))
+			Expect(drainingMembers).Should(BeEmpty())
+		})
+
+		// Note: Testing the full drain orchestration (disable -> wait -> delete) requires
+		// mocking the provider methods or using integration tests with actual load balancers.
+		// The Dummy provider logs operations but doesn't maintain state, so we can verify
+		// the orchestration logic calls the right methods but cannot easily test the
+		// time-based transitions without more complex mocking or integration tests.
+	})
 })

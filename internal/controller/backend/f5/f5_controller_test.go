@@ -343,6 +343,14 @@ var _ = Describe("When using a f5 backend", func() {
 			Eventually(func() string { return gjson.Get(httpdata.data, "session").String() }, timeout, interval).Should(Equal("user-disabled"))
 			Expect(err).NotTo(HaveOccurred())
 		})
+
+		It("Should disable pool member for graceful draining", func() {
+			err = createdBackend.Provider.DisablePoolMember(poolmember, pool)
+			Eventually(httpdata.url, timeout, interval).Should(Equal("/mgmt/tm/ltm/pool/test-pool/members/1.1.1.5:80"))
+			Eventually(httpdata.method, timeout, interval).Should(Equal("PUT"))
+			Eventually(gjson.Get(httpdata.data, "session").String(), timeout, interval).Should(Equal("user-disabled"))
+			Expect(err).NotTo(HaveOccurred())
+		})
 	})
 
 	Context("when handling load balancer VIPs", func() {

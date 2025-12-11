@@ -361,6 +361,17 @@ var _ = Describe("When using a Netscaler backend", func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
+		It("Should disable pool member for graceful draining", func() {
+			err = createdBackend.Provider.DisablePoolMember(poolmember, pool)
+			Eventually(httpdata.url, timeout, interval).Should(Equal("/nitro/v1/config/servicegroup?action=disable"))
+			Eventually(httpdata.method, timeout, interval).Should(Equal("POST"))
+			Eventually(func() string { return gjson.Get(httpdata.data, "servicegroup.servicegroupname").String() }, timeout, interval).Should(Equal("test-pool"))
+			Eventually(func() string { return gjson.Get(httpdata.data, "servicegroup.servername").String() }, timeout, interval).Should(Equal("1.1.1.5"))
+			Eventually(func() int64 { return gjson.Get(httpdata.data, "servicegroup.port").Int() }, timeout, interval).Should(Equal(int64(80)))
+			Eventually(func() string { return gjson.Get(httpdata.data, "servicegroup.graceful").String() }, timeout, interval).Should(Equal("YES"))
+			Expect(err).NotTo(HaveOccurred())
+		})
+
 		Context("when handling load balancer VIPs", func() {
 			var createdBackend *BackendController
 			var err error

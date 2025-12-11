@@ -131,6 +131,32 @@ spec:
   ...
 ```
 
+### Graceful Connection Draining
+
+The operator supports graceful connection draining to prevent connection drops when pool members are removed (e.g., during node maintenance, upgrades, or autoscaling). When enabled, the operator uses a 3-phase process:
+
+1. **Disable** the pool member (stops accepting new connections)
+2. **Wait** for a configurable timeout (allows existing connections to complete)
+3. **Delete** the pool member after the timeout expires
+
+This feature is optional and configured per ExternalLoadBalancer instance:
+
+```yaml
+spec:
+  drain:
+    enabled: true           # Enable graceful draining (default: false)
+    timeoutSeconds: 30      # Timeout in seconds (default: 30, min: 0, max: 3600)
+  ...
+```
+
+**Supported by all providers:**
+- **F5 BigIP**: Uses session `user-disabled` state for native graceful draining
+- **Citrix ADC/NetScaler**: Uses graceful service disable (TROFS state)
+- **HAProxy**: Uses maintenance mode via DataPlane API
+- **Dummy**: Logs operations for testing
+
+For detailed examples and configuration guidance, see the [drain feature documentation](config/samples/DRAIN_EXAMPLES.md).
+
 ## Development
 
 ### Getting Started

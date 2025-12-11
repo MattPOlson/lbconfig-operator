@@ -124,6 +124,15 @@ var pool = &lbv1.Pool{
 	},
 }
 
+var poolmember = &lbv1.PoolMember{
+	Node: lbv1.Node{
+		Name:   "test-node-5",
+		Host:   "1.1.1.5",
+		Labels: map[string]string{"node-role.kubernetes.io/master": ""},
+	},
+	Port: 80,
+}
+
 var VIP = &lbv1.VIP{
 	Name: "test-vip",
 	Pool: pool.Name,
@@ -273,6 +282,22 @@ var _ = Describe("When using a HAProxy backend", func() {
 				// Expect(err).To(MatchError(MatchRegexp("status 200")))
 				Eventually(func() string { return gjson.Get(httpdata.data[i], "name").String() }, timeout, interval).Should(Equal("test-pool"))
 				// Expect(err).To(BeNil())
+			})
+		})
+
+		Context("when handling load balancer pool members", func() {
+			It("Should disable pool member for graceful draining", func() {
+				err := createdBackend.Provider.DisablePoolMember(poolmember, pool)
+				// DisablePoolMember uses EditPoolMember which calls the DataPlane API to set maintenance mode
+				// HAProxy uses the node name, not the IP address, and includes backend query param
+				url := "/v2/services/haproxy/configuration/servers/test-node-5?backend=test-pool"
+				Eventually(httpdata.url, timeout, interval).Should(ContainElement(url))
+				i := indexOf(url, httpdata.url)
+				Eventually(httpdata.method[i], timeout, interval).Should(Equal("PUT"))
+				// HAProxy DataPlane API sets maintenance mode when disabling
+				Eventually(gjson.Get(httpdata.data[i], "maintenance").String(), timeout, interval).Should(Equal("enabled"))
+				// The operation should succeed with the mock server
+				Expect(err).NotTo(HaveOccurred())
 			})
 		})
 
