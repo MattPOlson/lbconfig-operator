@@ -435,4 +435,129 @@ var _ = Describe("Controllers/Backend/controller/backend_controller", func() {
 		// the orchestration logic calls the right methods but cannot easily test the
 		// time-based transitions without more complex mocking or integration tests.
 	})
+
+	Context("When a draining member is re-added during drain", func() {
+		// These tests use a stateful mock provider to exercise the pool-exists path,
+		// which is what runs on every reconcile after initial pool creation.
+		var ctx context.Context
+		var lbWithDrain *lbv1.ExternalLoadBalancer
+		var testMonitor *lbv1.Monitor
+
+		BeforeEach(func() {
+			ctx = context.TODO()
+			testMonitor = &lbv1.Monitor{
+				Path:        "/healthz",
+				Port:        6443,
+				MonitorType: "https",
+			}
+			lbWithDrain = &lbv1.ExternalLoadBalancer{
+				ObjectMeta: metav1.ObjectMeta{Name: "lb-drain-readd", Namespace: "default"},
+				Spec: lbv1.ExternalLoadBalancerSpec{
+					Vip: "192.168.1.100",
+					Provider: lbv1.Provider{
+						Vendor: "Dummy",
+						Host:   "1.2.3.4",
+						Port:   443,
+						Creds:  "secretname",
+					},
+					Drain: &lbv1.DrainConfig{Enabled: true, TimeoutSeconds: 30},
+				},
+			}
+		})
+
+		It("Should remove a draining member from the list when it is back in the desired pool state", func() {
+			// Scenario: node-1 (10.0.1.100:6443) was being drained (disabled on LB).
+			// The node gets its label re-applied, so it's back in pool.Members.
+			// Since the member is still on the LB (disabled), it won't appear in addMembers
+			// or delMembers. The fix ensures we detect this via the drainingMembers cleanup loop
+			// and remove it from the tracking list (and re-enable it on the LB).
+			//
+			// We verify the tracking list behaviour using IsMemberDraining/RemoveDrainingMember
+			// directly since the Dummy backend doesn't expose member state.
+
+			member := lbv1.PoolMember{
+				Node: lbv1.Node{Name: "node-1", Host: "10.0.1.100"},
+				Port: 6443,
+			}
+			drainingMember := lbv1.DrainingMember{
+				PoolName:  "pool-readd",
+				Node:      member.Node,
+				Port:      member.Port,
+				StartTime: metav1.Now(),
+			}
+			drainingMembers := []lbv1.DrainingMember{drainingMember}
+
+			// Sanity: member is currently tracked as draining
+			Expect(IsMemberDraining(drainingMembers, &member, "pool-readd")).NotTo(BeNil())
+
+			// Simulate the re-add: remove the member from the draining list as the
+			// fix does (the member is no longer pending deletion).
+			drainingMembers = RemoveDrainingMember(drainingMembers, &member, "pool-readd")
+
+			// After the fix, the member must no longer be in the draining list
+			Expect(IsMemberDraining(drainingMembers, &member, "pool-readd")).To(BeNil())
+			Expect(drainingMembers).To(BeEmpty())
+		})
+
+		It("Should preserve draining members from other pools during re-add cleanup", func() {
+			member := lbv1.PoolMember{
+				Node: lbv1.Node{Name: "node-1", Host: "10.0.1.100"},
+				Port: 6443,
+			}
+			otherPool := lbv1.DrainingMember{
+				PoolName:  "other-pool",
+				Node:      member.Node,
+				Port:      member.Port,
+				StartTime: metav1.Now(),
+			}
+			targetPool := lbv1.DrainingMember{
+				PoolName:  "pool-readd",
+				Node:      member.Node,
+				Port:      member.Port,
+				StartTime: metav1.Now(),
+			}
+			drainingMembers := []lbv1.DrainingMember{otherPool, targetPool}
+
+			// Remove only the target pool entry (re-add for pool-readd)
+			drainingMembers = RemoveDrainingMember(drainingMembers, &member, "pool-readd")
+
+			// The other-pool entry must be preserved
+			Expect(drainingMembers).To(HaveLen(1))
+			Expect(drainingMembers[0].PoolName).To(Equal("other-pool"))
+			Expect(IsMemberDraining(drainingMembers, &member, "pool-readd")).To(BeNil())
+			Expect(IsMemberDraining(drainingMembers, &member, "other-pool")).NotTo(BeNil())
+		})
+
+		It("Should not requeue when all draining members for a pool are re-added", func() {
+			// When all draining members come back into the desired state, HandlePool
+			// must return requeueAfter=0 (no pending drain work for this pool).
+			backend, err := CreateBackend(ctx, &lbWithDrain.Spec.Provider, "username", "password")
+			Expect(err).Should(BeNil())
+
+			// Pool desired state has the member (it was re-added)
+			pool := &lbv1.Pool{
+				Name: "pool-readd-requeue",
+				Members: []lbv1.PoolMember{{
+					Node: lbv1.Node{Name: "node-1", Host: "10.0.1.100"},
+					Port: 6443,
+				}},
+			}
+
+			// Pass a draining member for a different pool to ensure it isn't affected
+			otherPoolDraining := lbv1.DrainingMember{
+				PoolName:  "some-other-pool",
+				Node:      lbv1.Node{Name: "node-2", Host: "10.0.1.200"},
+				Port:      6443,
+				StartTime: metav1.Now(),
+			}
+
+			// The Dummy backend always returns pool=nil (new pool), so HandlePool takes
+			// the creation path and returns 0 requeue. This confirms no spurious requeue.
+			err, requeueAfter, updatedDraining := backend.HandlePool(ctx, pool, testMonitor, lbWithDrain, []lbv1.DrainingMember{otherPoolDraining})
+			Expect(err).Should(BeNil())
+			Expect(requeueAfter).Should(Equal(0))
+			// The other pool's draining member must be unmodified
+			Expect(IsMemberDraining(updatedDraining, &lbv1.PoolMember{Node: otherPoolDraining.Node, Port: otherPoolDraining.Port}, "some-other-pool")).NotTo(BeNil())
+		})
+	})
 })

@@ -260,6 +260,36 @@ func (b *BackendController) HandlePool(ctx context.Context, pool *lbv1.Pool, mon
 			}
 		}
 
+		// Cleanup draining members that are no longer pending removal.
+		// This handles re-add during drain: if a node is re-added while its member is
+		// disabled and draining, the member won't appear in addMembers (it's already on
+		// the LB) or delMembers (it's back in desired state), so the drain cleanup code
+		// is never reached. We catch it here and re-enable it.
+		for _, dm := range drainingMembers {
+			if dm.PoolName != pool.Name {
+				continue
+			}
+			memberToCheck := lbv1.PoolMember{Node: dm.Node, Port: dm.Port}
+			if !ContainsMember(delMembers, memberToCheck) {
+				if ContainsMember(pool.Members, memberToCheck) {
+					// Member is back in the desired state but still disabled on the LB - re-enable it
+					b.log.Info("Re-enabling member that was re-added during drain", "node", dm.Node.Name, "pool", pool.Name)
+					err := func(ctx context.Context) error {
+						_, span := otel.Tracer(name).Start(ctx, "Provider - EditPoolMember (re-enable)")
+						span.SetAttributes(attribute.String("pool.name", pool.Name), attribute.String("pool.member", dm.Node.Name))
+						defer span.End()
+						return b.Provider.EditPoolMember(&memberToCheck, pool, "enable")
+					}(ctx)
+					if err != nil {
+						b.log.Error(err, "Failed to re-enable member after re-add during drain", "node", dm.Node.Name)
+						return err, 0, drainingMembers
+					}
+				}
+				// Remove from draining list regardless (no longer pending deletion)
+				drainingMembers = RemoveDrainingMember(drainingMembers, &memberToCheck, pool.Name)
+			}
+		}
+
 		if pool.Monitor != configuredPool.Monitor {
 			span.SetAttributes(attribute.String("pool.name", pool.Name), attribute.Bool("pool.update", true))
 			b.log.Info("Pool requires update", "name", pool.Name)
