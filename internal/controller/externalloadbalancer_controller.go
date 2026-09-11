@@ -203,7 +203,7 @@ func (r *ExternalLoadBalancerReconciler) Reconcile(ctx context.Context, req ctrl
 	// ----------------------------------------
 	if lb.Spec.Type == "" && lb.Spec.NodeLabels == nil {
 		err = fmt.Errorf("undefined loadbalancer type or no nodelabels defined")
-		return ctrl.Result{Requeue: false}, err
+		return ctrl.Result{}, err
 	}
 
 	labels := func(ctx context.Context) map[string]string {
