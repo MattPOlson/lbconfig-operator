@@ -388,6 +388,22 @@ func (p *NetscalerProvider) CreatePoolMember(m *lbv1.PoolMember, pool *lbv1.Pool
 // EditPoolMember modifies a server pool member in the Load Balancer
 // status could be "enable" or "disable"
 func (p *NetscalerProvider) EditPoolMember(m *lbv1.PoolMember, pool *lbv1.Pool, status string) error {
+	if status != "enable" && status != "disable" {
+		return fmt.Errorf("invalid status %q for member %s in pool %s, must be enable or disable", status, m.Node.Host, pool.Name)
+	}
+
+	memberParams := basic.Servicegroup{
+		Servicegroupname: pool.Name,
+		Servername:       m.Node.Host,
+		Port:             m.Port,
+	}
+
+	err := p.client.ActOnResource(service.Servicegroup.Type(), &memberParams, status)
+
+	if err != nil {
+		return fmt.Errorf("error setting member %s in pool %s to %s: %v", m.Node.Host, pool.Name, status, err)
+	}
+
 	return nil
 }
 
