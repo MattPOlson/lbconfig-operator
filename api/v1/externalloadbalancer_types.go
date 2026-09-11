@@ -202,10 +202,10 @@ type DrainConfig struct {
 	Enabled bool `json:"enabled,omitempty"`
 
 	// TimeoutSeconds is the duration in seconds to wait for connections to drain before deleting the pool member.
-	// This allows time for active connections to complete gracefully.
+	// This allows time for active connections to complete gracefully. To remove members immediately, keep draining disabled.
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
 	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=3600
 	// +kubebuilder:default=30
 	TimeoutSeconds int `json:"timeoutSeconds,omitempty"`

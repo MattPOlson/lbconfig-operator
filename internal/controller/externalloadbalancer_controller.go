@@ -301,11 +301,9 @@ func (r *ExternalLoadBalancerReconciler) Reconcile(ctx context.Context, req ctrl
 	// Handle IP Pools
 	// ----------------------------------------
 	pools := make([]lbv1.Pool, 0, len(lb.Spec.Ports))
-	drainingMembers := lb.Status.DrainingMembers // Get current draining members from status
-	if drainingMembers == nil {
-		drainingMembers = []lbv1.DrainingMember{}
-	}
-	maxRequeueAfter := 0 // Track the longest requeue time needed
+	// Members being drained are tracked in the status so draining survives requeues and operator restarts
+	drainingMembers := lb.Status.DrainingMembers
+	var drainRequeueAfter time.Duration // Soonest time a draining member is due for removal
 
 	for _, p := range lb.Spec.Ports {
 		// Create pool members based on nodes
@@ -325,7 +323,7 @@ func (r *ExternalLoadBalancerReconciler) Reconcile(ctx context.Context, req ctrl
 			Members: poolMembers,
 		}
 
-		err, requeueAfter, updatedDrainingMembers := backend.HandlePool(ctx, &pool, &monitor, lb, drainingMembers)
+		requeueAfter, updatedDrainingMembers, err := backend.HandlePool(ctx, &pool, &monitor, lb, drainingMembers)
 		if err != nil {
 			logger.Error(err, "unable to handle ExternalLoadBalancer IP pool")
 			span.RecordError(err)
@@ -334,13 +332,8 @@ func (r *ExternalLoadBalancerReconciler) Reconcile(ctx context.Context, req ctrl
 			return ctrl.Result{}, err
 		}
 
-		// Update draining members list
 		drainingMembers = updatedDrainingMembers
-
-		// Track the maximum requeue time needed across all pools
-		if requeueAfter > maxRequeueAfter {
-			maxRequeueAfter = requeueAfter
-		}
+		drainRequeueAfter = soonestRequeue(drainRequeueAfter, requeueAfter)
 
 		pools = append(pools, pool)
 	}
@@ -403,7 +396,7 @@ func (r *ExternalLoadBalancerReconciler) Reconcile(ctx context.Context, req ctrl
 		Provider:        lb.Spec.Provider,
 		Labels:          labels,
 		NumNodes:        len(nodes),
-		DrainingMembers: drainingMembers,
+		DrainingMembers: drainingMembersForPools(drainingMembers, pools),
 	}
 
 	err = func(ctx context.Context) error {
@@ -500,10 +493,10 @@ func (r *ExternalLoadBalancerReconciler) Reconcile(ctx context.Context, req ctrl
 
 	logger.Info("End of reconcile loop for ExternalLoadBalancer")
 
-	// If any pools have members draining, requeue after the specified time
-	if maxRequeueAfter > 0 {
-		logger.Info("Requeuing to check draining members", "after_seconds", maxRequeueAfter)
-		return ctrl.Result{RequeueAfter: time.Duration(maxRequeueAfter) * time.Second}, nil
+	// Requeue to remove draining members once their drain timeout expires
+	if drainRequeueAfter > 0 {
+		logger.Info("Requeuing to check draining members", "after", drainRequeueAfter.String())
+		return ctrl.Result{RequeueAfter: drainRequeueAfter}, nil
 	}
 
 	return ctrl.Result{}, nil

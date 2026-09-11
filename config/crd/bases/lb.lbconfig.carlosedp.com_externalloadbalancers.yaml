@@ -85,9 +85,9 @@ spec:
                     default: 30
                     description: |-
                       TimeoutSeconds is the duration in seconds to wait for connections to drain before deleting the pool member.
-                      This allows time for active connections to complete gracefully.
+                      This allows time for active connections to complete gracefully. To remove members immediately, keep draining disabled.
                     maximum: 3600
-                    minimum: 0
+                    minimum: 1
                     type: integer
                 type: object
               monitor:

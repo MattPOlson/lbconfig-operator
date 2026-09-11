@@ -206,9 +206,14 @@ func (b *BackendController) HandleMonitors(ctx context.Context, monitor *lbv1.Mo
 	return nil
 }
 
-// HandlePool manages the Pool validation, update and creation
-// Returns: error, requeue duration (0 if no requeue needed), updated draining members list
-func (b *BackendController) HandlePool(ctx context.Context, pool *lbv1.Pool, monitor *lbv1.Monitor, lb *lbv1.ExternalLoadBalancer, drainingMembers []lbv1.DrainingMember) (error, int, []lbv1.DrainingMember) {
+// DefaultDrainTimeoutSeconds is the drain timeout used when draining is enabled without an explicit timeout
+const DefaultDrainTimeoutSeconds = 30
+
+// HandlePool manages the Pool validation, update and creation.
+// drainingMembers holds the members currently being drained (persisted in the ExternalLoadBalancer status).
+// It returns how long to wait until a draining member is due for removal (0 if no member is draining)
+// and the updated draining members list.
+func (b *BackendController) HandlePool(ctx context.Context, pool *lbv1.Pool, monitor *lbv1.Monitor, lb *lbv1.ExternalLoadBalancer, drainingMembers []lbv1.DrainingMember) (time.Duration, []lbv1.DrainingMember, error) {
 	var span trace.Span
 	ctx, span = otel.Tracer(name).Start(ctx, "HandlePool")
 	span.SetAttributes(attribute.String("pool.name", pool.Name))
@@ -222,7 +227,7 @@ func (b *BackendController) HandlePool(ctx context.Context, pool *lbv1.Pool, mon
 		return b.Provider.GetPool(pool)
 	}(ctx)
 	if err != nil {
-		return err, 0, drainingMembers
+		return 0, drainingMembers, err
 	}
 
 	// Pool is not empty so update it's data if needed
@@ -237,7 +242,7 @@ func (b *BackendController) HandlePool(ctx context.Context, pool *lbv1.Pool, mon
 			return b.Provider.GetPoolMembers(p)
 		}(ctx)
 		if err != nil {
-			return err, 0, drainingMembers
+			return 0, drainingMembers, err
 		}
 
 		// Exists, so check to Update pool parameters and members
@@ -260,34 +265,10 @@ func (b *BackendController) HandlePool(ctx context.Context, pool *lbv1.Pool, mon
 			}
 		}
 
-		// Cleanup draining members that are no longer pending removal.
-		// This handles re-add during drain: if a node is re-added while its member is
-		// disabled and draining, the member won't appear in addMembers (it's already on
-		// the LB) or delMembers (it's back in desired state), so the drain cleanup code
-		// is never reached. We catch it here and re-enable it.
-		for _, dm := range drainingMembers {
-			if dm.PoolName != pool.Name {
-				continue
-			}
-			memberToCheck := lbv1.PoolMember{Node: dm.Node, Port: dm.Port}
-			if !ContainsMember(delMembers, memberToCheck) {
-				if ContainsMember(pool.Members, memberToCheck) {
-					// Member is back in the desired state but still disabled on the LB - re-enable it
-					b.log.Info("Re-enabling member that was re-added during drain", "node", dm.Node.Name, "pool", pool.Name)
-					err := func(ctx context.Context) error {
-						_, span := otel.Tracer(name).Start(ctx, "Provider - EditPoolMember (re-enable)")
-						span.SetAttributes(attribute.String("pool.name", pool.Name), attribute.String("pool.member", dm.Node.Name))
-						defer span.End()
-						return b.Provider.EditPoolMember(&memberToCheck, pool, "enable")
-					}(ctx)
-					if err != nil {
-						b.log.Error(err, "Failed to re-enable member after re-add during drain", "node", dm.Node.Name)
-						return err, 0, drainingMembers
-					}
-				}
-				// Remove from draining list regardless (no longer pending deletion)
-				drainingMembers = RemoveDrainingMember(drainingMembers, &memberToCheck, pool.Name)
-			}
+		// Stop tracking draining members that are no longer pending removal (eg. re-added during the drain)
+		drainingMembers, err = b.releaseDrainingMembers(ctx, pool, configuredPool, delMembers, drainingMembers)
+		if err != nil {
+			return 0, drainingMembers, err
 		}
 
 		if pool.Monitor != configuredPool.Monitor {
@@ -302,7 +283,7 @@ func (b *BackendController) HandlePool(ctx context.Context, pool *lbv1.Pool, mon
 				return b.Provider.EditPool(pool)
 			}(ctx)
 			if err != nil {
-				return err, 0, drainingMembers
+				return 0, drainingMembers, err
 			}
 		}
 
@@ -315,9 +296,6 @@ func (b *BackendController) HandlePool(ctx context.Context, pool *lbv1.Pool, mon
 			if addMembers != nil {
 				b.log.Info("Add nodes", "nodes", addMembers)
 				for _, m := range addMembers {
-					// If this member was draining, remove it from the draining list since it's being re-added
-					drainingMembers = RemoveDrainingMember(drainingMembers, &m, pool.Name)
-
 					err := func(ctx context.Context) error {
 						_, span := otel.Tracer(name).Start(ctx, "Provider - CreatePoolMember")
 						span.SetAttributes(attribute.String("pool.name", pool.Name), attribute.String("pool.member", m.Node.Name))
@@ -325,120 +303,31 @@ func (b *BackendController) HandlePool(ctx context.Context, pool *lbv1.Pool, mon
 						return b.Provider.CreatePoolMember(&m, pool)
 					}(ctx)
 					if err != nil {
-						return err, 0, drainingMembers
+						return 0, drainingMembers, err
 					}
 				}
 			}
 
-			// Remove members - with optional graceful draining
+			// Remove members, draining them first if enabled
 			if delMembers != nil {
 				b.log.Info("Remove nodes", "nodes", delMembers)
-
-				// Check if drain is enabled
-				drainEnabled := lb.Spec.Drain != nil && lb.Spec.Drain.Enabled
-				drainTimeout := 30 // default timeout in seconds
-				if drainEnabled && lb.Spec.Drain.TimeoutSeconds > 0 {
-					drainTimeout = lb.Spec.Drain.TimeoutSeconds
+				var requeueAfter time.Duration
+				requeueAfter, drainingMembers, err = b.removePoolMembers(ctx, pool, delMembers, lb.Spec.Drain, drainingMembers)
+				if err != nil {
+					return 0, drainingMembers, err
 				}
-
-				requeueAfter := 0 // Track if we need to requeue
-
-				for _, m := range delMembers {
-					if drainEnabled {
-						// 3-Phase Drain Process
-						drainingMember := IsMemberDraining(drainingMembers, &m, pool.Name)
-
-						if drainingMember == nil {
-							// Phase 1: Disable the member and add to draining list
-							b.log.Info("Starting graceful drain for member", "node", m.Node.Name, "pool", pool.Name, "timeout", drainTimeout)
-
-							err := func(ctx context.Context) error {
-								_, span := otel.Tracer(name).Start(ctx, "Provider - DisablePoolMember")
-								span.SetAttributes(attribute.String("pool.name", pool.Name), attribute.String("pool.member", m.Node.Name))
-								defer span.End()
-								return b.Provider.DisablePoolMember(&m, pool)
-							}(ctx)
-							if err != nil {
-								b.log.Error(err, "Failed to disable pool member for draining", "node", m.Node.Name)
-								return err, 0, drainingMembers
-							}
-
-							// Add to draining members list
-							newDrainingMember := lbv1.DrainingMember{
-								PoolName:  pool.Name,
-								Node:      m.Node,
-								Port:      m.Port,
-								StartTime: metav1.Now(),
-							}
-							drainingMembers = append(drainingMembers, newDrainingMember)
-
-							// Requeue after the drain timeout
-							if requeueAfter == 0 || drainTimeout < requeueAfter {
-								requeueAfter = drainTimeout
-							}
-
-						} else {
-							// Phase 2 & 3: Check if drain timeout expired
-							elapsedSeconds := int(time.Since(drainingMember.StartTime.Time).Seconds())
-
-							if elapsedSeconds >= drainTimeout {
-								// Timeout expired - delete the member
-								b.log.Info("Drain timeout expired, deleting member", "node", m.Node.Name, "pool", pool.Name, "elapsed", elapsedSeconds)
-
-								err := func(ctx context.Context) error {
-									_, span := otel.Tracer(name).Start(ctx, "Provider - DeletePoolMember")
-									span.SetAttributes(attribute.String("pool.name", pool.Name), attribute.String("pool.member", m.Node.Name))
-									defer span.End()
-									return b.Provider.DeletePoolMember(&m, pool)
-								}(ctx)
-								if err != nil {
-									b.log.Error(err, "Failed to delete pool member after drain", "node", m.Node.Name)
-									return err, 0, drainingMembers
-								}
-
-								// Remove from draining list
-								drainingMembers = RemoveDrainingMember(drainingMembers, &m, pool.Name)
-
-							} else {
-								// Still draining - requeue to check again later
-								remainingSeconds := drainTimeout - elapsedSeconds
-								b.log.Info("Member still draining", "node", m.Node.Name, "pool", pool.Name, "remaining", remainingSeconds)
-
-								if requeueAfter == 0 || remainingSeconds < requeueAfter {
-									requeueAfter = remainingSeconds
-								}
-							}
-						}
-					} else {
-						// Drain not enabled - delete immediately
-						err := func(ctx context.Context) error {
-							_, span := otel.Tracer(name).Start(ctx, "Provider - DeletePoolMember")
-							span.SetAttributes(attribute.String("pool.name", pool.Name), attribute.String("pool.member", m.Node.Name))
-							defer span.End()
-							return b.Provider.DeletePoolMember(&m, pool)
-						}(ctx)
-						if err != nil {
-							return err, 0, drainingMembers
-						}
-
-						// Remove from draining list if it was there
-						drainingMembers = RemoveDrainingMember(drainingMembers, &m, pool.Name)
-					}
-				}
-
-				// If we have members still draining, return requeue time
 				if requeueAfter > 0 {
-					b.log.Info("Requeuing to check draining members", "after_seconds", requeueAfter, "pool", pool.Name)
-					return nil, requeueAfter, drainingMembers
+					b.log.Info("Pool members still draining", "name", pool.Name, "requeueAfter", requeueAfter.String())
+					return requeueAfter, drainingMembers, nil
 				}
 			}
 
 			b.log.Info("Pool updated successfully", "name", pool.Name)
-			return nil, 0, drainingMembers
+			return 0, drainingMembers, nil
 		}
 		b.log.Info("Pool does not need update", "name", pool.Name)
 		span.SetAttributes(attribute.String("pool.name", pool.Name), attribute.Bool("pool.members.update", false))
-		return nil, 0, drainingMembers
+		return 0, drainingMembers, nil
 	}
 
 	// Creating pool
@@ -451,7 +340,7 @@ func (b *BackendController) HandlePool(ctx context.Context, pool *lbv1.Pool, mon
 		return b.Provider.CreatePool(pool)
 	}(ctx)
 	if err != nil {
-		return err, 0, drainingMembers
+		return 0, drainingMembers, err
 	}
 	// Adding members to pool
 	b.log.Info("Created pool", "name", pool.Name)
@@ -464,10 +353,100 @@ func (b *BackendController) HandlePool(ctx context.Context, pool *lbv1.Pool, mon
 			return b.Provider.CreatePoolMember(&m, pool)
 		}(ctx)
 		if err != nil {
-			return err, 0, drainingMembers
+			return 0, drainingMembers, err
 		}
 	}
-	return nil, 0, drainingMembers
+	return 0, drainingMembers, nil
+}
+
+// releaseDrainingMembers stops tracking the pool draining members that are no longer pending removal.
+// When a node comes back (eg. its label is re-applied) while its member is still disabled on the load balancer,
+// the member is neither added nor removed, so it is re-enabled here. Members that are no longer configured on
+// the load balancer are just dropped from the list since they are recreated (enabled) if desired again.
+func (b *BackendController) releaseDrainingMembers(ctx context.Context, pool *lbv1.Pool, configuredPool *lbv1.Pool, delMembers []lbv1.PoolMember, drainingMembers []lbv1.DrainingMember) ([]lbv1.DrainingMember, error) {
+	for _, dm := range drainingMembers {
+		m := lbv1.PoolMember{Node: dm.Node, Port: dm.Port}
+		if dm.PoolName != pool.Name || ContainsMember(delMembers, m) {
+			continue
+		}
+		if ContainsMember(pool.Members, m) && ContainsMember(configuredPool.Members, m) {
+			b.log.Info("Re-enabling member that was re-added during drain", "node", dm.Node.Name, "pool", pool.Name)
+			err := func(ctx context.Context) error {
+				_, span := otel.Tracer(name).Start(ctx, "Provider - EditPoolMember")
+				span.SetAttributes(attribute.String("pool.name", pool.Name), attribute.String("pool.member", dm.Node.Name))
+				defer span.End()
+				return b.Provider.EditPoolMember(&m, pool, "enable")
+			}(ctx)
+			if err != nil {
+				return drainingMembers, fmt.Errorf("error re-enabling drained member %s: %v", dm.Node.Host, err)
+			}
+		}
+		drainingMembers = RemoveDrainingMember(drainingMembers, &m, pool.Name)
+	}
+	return drainingMembers, nil
+}
+
+// removePoolMembers removes members from the pool. When draining is enabled, a member is first disabled so it stops
+// receiving new connections while the existing ones complete, and is only deleted once the drain timeout elapsed.
+// It returns how long to wait until the next draining member is due for removal (0 if no member is draining).
+func (b *BackendController) removePoolMembers(ctx context.Context, pool *lbv1.Pool, delMembers []lbv1.PoolMember, drain *lbv1.DrainConfig, drainingMembers []lbv1.DrainingMember) (time.Duration, []lbv1.DrainingMember, error) {
+	drainEnabled := drain != nil && drain.Enabled
+	drainTimeout := DefaultDrainTimeoutSeconds * time.Second
+	if drainEnabled && drain.TimeoutSeconds > 0 {
+		drainTimeout = time.Duration(drain.TimeoutSeconds) * time.Second
+	}
+
+	var requeueAfter time.Duration
+	for _, m := range delMembers {
+		if drainEnabled {
+			var remaining time.Duration
+			if dm := IsMemberDraining(drainingMembers, &m, pool.Name); dm == nil {
+				// Disable the member and start tracking its drain
+				b.log.Info("Starting graceful drain for member", "node", m.Node.Name, "pool", pool.Name, "timeout", drainTimeout.String())
+				err := func(ctx context.Context) error {
+					_, span := otel.Tracer(name).Start(ctx, "Provider - DisablePoolMember")
+					span.SetAttributes(attribute.String("pool.name", pool.Name), attribute.String("pool.member", m.Node.Name))
+					defer span.End()
+					return b.Provider.DisablePoolMember(&m, pool)
+				}(ctx)
+				if err != nil {
+					return 0, drainingMembers, fmt.Errorf("error disabling member %s for draining: %v", m.Node.Host, err)
+				}
+				// Status timestamps have second precision, round the start time up so the drain is never shortened
+				startTime := metav1.NewTime(time.Now().Truncate(time.Second).Add(time.Second))
+				drainingMembers = append(drainingMembers, lbv1.DrainingMember{
+					PoolName:  pool.Name,
+					Node:      m.Node,
+					Port:      m.Port,
+					StartTime: startTime,
+				})
+				remaining = drainTimeout + time.Until(startTime.Time)
+			} else {
+				remaining = drainTimeout - time.Since(dm.StartTime.Time)
+			}
+
+			if remaining > 0 {
+				b.log.Info("Member draining", "node", m.Node.Name, "pool", pool.Name, "remaining", remaining.Round(time.Second).String())
+				if requeueAfter == 0 || remaining < requeueAfter {
+					requeueAfter = remaining
+				}
+				continue
+			}
+			b.log.Info("Drain timeout expired, deleting member", "node", m.Node.Name, "pool", pool.Name)
+		}
+
+		err := func(ctx context.Context) error {
+			_, span := otel.Tracer(name).Start(ctx, "Provider - DeletePoolMember")
+			span.SetAttributes(attribute.String("pool.name", pool.Name), attribute.String("pool.member", m.Node.Name))
+			defer span.End()
+			return b.Provider.DeletePoolMember(&m, pool)
+		}(ctx)
+		if err != nil {
+			return 0, drainingMembers, err
+		}
+		drainingMembers = RemoveDrainingMember(drainingMembers, &m, pool.Name)
+	}
+	return requeueAfter, drainingMembers, nil
 }
 
 // HandleVIP manages the VIP validation, update and creation
