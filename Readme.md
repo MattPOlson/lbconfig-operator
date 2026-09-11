@@ -145,15 +145,17 @@ This feature is optional and configured per ExternalLoadBalancer instance:
 spec:
   drain:
     enabled: true           # Enable graceful draining (default: false)
-    timeoutSeconds: 30      # Timeout in seconds (default: 30, min: 0, max: 3600)
+    timeoutSeconds: 30      # Timeout in seconds (default: 30, min: 1, max: 3600)
   ...
 ```
 
-**Supported by all providers:**
+**Provider support:**
 - **F5 BigIP**: Uses session `user-disabled` state for native graceful draining
 - **Citrix ADC/NetScaler**: Uses graceful service disable (TROFS state)
 - **HAProxy**: Uses maintenance mode via DataPlane API
-- **Dummy**: Logs operations for testing
+- **Dummy**: Does not keep pool state, so members are never drained
+
+If a node comes back before its drain timeout expires, its member is re-enabled instead of deleted.
 
 For detailed examples and configuration guidance, see the [drain feature documentation](config/samples/DRAIN_EXAMPLES.md).
 

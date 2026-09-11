@@ -18,7 +18,7 @@ The drain feature is configured in the ExternalLoadBalancer spec:
 spec:
   drain:
     enabled: true           # Enable/disable graceful draining (default: false)
-    timeoutSeconds: 30      # Timeout in seconds (default: 30, min: 0, max: 3600)
+    timeoutSeconds: 30      # Timeout in seconds (default: 30, min: 1, max: 3600)
 ```
 
 ## Use Cases
@@ -68,14 +68,12 @@ drain:
 
 ## Provider Support
 
-All load balancer providers support graceful draining:
-
 | Provider | Implementation | Notes |
 |----------|---------------|-------|
-| **F5 BigIP** | Session user-disabled | Native graceful drain support |
-| **Citrix ADC/NetScaler** | Graceful service disable | Enters TROFS (Transition Out of Service) state |
-| **HAProxy** | Maintenance mode | Uses DataPlane API maintenance mode |
-| **Dummy** | Logging only | For testing purposes |
+| **F5 BigIP** | Member session `user-disabled` | Active and persistent connections continue, new connections go to other members |
+| **Citrix ADC/NetScaler** | Graceful servicegroup member disable | Enters TROFS (Transition Out of Service) state |
+| **HAProxy** | Server maintenance mode | Set through the DataPlane API |
+| **Dummy** | None | Does not keep pool state, so members are never drained |
 
 ## How It Works
 
@@ -98,6 +96,14 @@ Time 30s:  Timeout expires
            → Pool member deleted from load balancer
 ```
 
+When several members are draining, the operator requeues for the member closest to its timeout.
+
+### Node Added Back During the Drain
+
+If the node comes back before its drain timeout expires (for example its label is re-applied or it becomes Ready again), the member is re-enabled on the load balancer and removed from `drainingMembers` instead of being deleted. If the member was deleted from the load balancer in the meantime, it is recreated.
+
+Disabling the drain (`enabled: false`) while members are draining deletes them on the next reconciliation.
+
 ### State Tracking
 
 The operator tracks draining members in the ExternalLoadBalancer status:
@@ -113,7 +119,7 @@ status:
       startTime: "2025-12-10T21:50:00Z"
 ```
 
-This state persists across reconciliation loops and operator restarts.
+This state persists across reconciliation loops and operator restarts, so a restarted operator resumes the drain where it left off instead of restarting the timeout.
 
 ## Choosing the Right Timeout
 
@@ -168,10 +174,12 @@ Prevents drops when changing node labels for router sharding or workload placeme
 
 ## Testing
 
-You can test the drain feature using the Dummy provider:
+The Dummy provider does not keep pool state, so it never exercises the drain. The drain flow is covered by `make test`, with unit tests using a stateful in-memory provider and an integration test running the controller against a simulated F5 BIG-IP API.
+
+To observe it with a real load balancer:
 
 ```bash
-# Apply example with drain enabled
+# Apply an ExternalLoadBalancer with drain enabled (adjust the provider settings first)
 kubectl apply -f config/samples/lb_v1_externalloadbalancer-drain-default.yaml
 
 # Watch the operator logs
@@ -180,10 +188,11 @@ kubectl logs -n lbconfig-operator-system deployment/lbconfig-operator-controller
 # Trigger drain by removing a node label
 kubectl label node <node-name> node-role.kubernetes.io/master-
 
-# Observe the 3-phase process in logs:
+# Observe the process in the logs:
 # 1. "Starting graceful drain for member"
-# 2. "Member still draining" (if reconciled during wait)
+# 2. "Member draining" (logged on every reconciliation during the wait)
 # 3. "Drain timeout expired, deleting member"
+# Re-applying the label before the timeout logs "Re-enabling member that was re-added during drain"
 ```
 
 ## Troubleshooting
@@ -209,7 +218,7 @@ drain:
 kubectl logs -n lbconfig-operator-system deployment/lbconfig-operator-controller-manager
 ```
 
-Look for errors in `DisablePoolMember` or `DeletePoolMember` calls.
+Look for errors in `DisablePoolMember`, `EditPoolMember` or `DeletePoolMember` calls.
 
 ### Drain taking longer than expected
 
@@ -220,9 +229,8 @@ Look for errors in `DisablePoolMember` or `DeletePoolMember` calls.
 ## Additional Examples
 
 See the `config/samples/` directory for more examples:
-- `lb_v1_externalloadbalancer-master.yaml` - Master nodes (without drain)
-- `lb_v1_externalloadbalancer-infra.yaml` - Infra nodes (without drain)
-- `lb_v1_externalloadbalancer-haproxy.yaml` - HAProxy provider (without drain)
+- `lb_v1_externalloadbalancer_master.yaml` - Master nodes (without drain)
+- `lb_v1_externalloadbalancer_infra.yaml` - Infra nodes (without drain)
 
 ## References
 
