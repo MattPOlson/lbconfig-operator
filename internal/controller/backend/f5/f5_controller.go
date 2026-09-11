@@ -336,7 +336,9 @@ func (p *F5Provider) CreatePoolMember(m *lbv1.PoolMember, pool *lbv1.Pool) error
 // EditPoolMember modifies a server pool member in the Load Balancer
 // status could be "enable" or "disable"
 func (p *F5Provider) EditPoolMember(m *lbv1.PoolMember, pool *lbv1.Pool, status string) error {
-	err := p.f5.PoolMemberStatus(pool.Name, m.Node.Host+":"+strconv.Itoa(m.Port), status)
+	// Pool members must be addressed through the partition-qualified pool name (eg. ~Common~pool/members/1.2.3.4:443),
+	// otherwise BIG-IP answers "Object not found" for the member.
+	err := p.f5.PoolMemberStatus(p.partition+pool.Name, m.Node.Host+":"+strconv.Itoa(m.Port), status)
 	if err != nil {
 		return fmt.Errorf("error editing member %s in pool %s: %v", m.Node.Host, pool.Name, err)
 	}
